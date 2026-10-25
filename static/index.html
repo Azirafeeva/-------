@@ -473,8 +473,12 @@
             Поддерживаются XML-файлы ФНС России (КНД 0710099 версия <strong>5.08</strong> и упрощенная КНД 0710096 версия <strong>5.03</strong> в UTF-8 и Windows-1251), а также шаблоны <strong>.xlsx</strong> и <strong>.json</strong> из папки <code>sample_data/</code>.
           </p>
           <div class="mb-3">
-            <label class="form-label fw-semibold small">Выберите файл отчетности (.xml, .xlsx, .json)</label>
-            <input type="file" id="importFileInput" class="form-control" accept=".xml,.xlsx,.json" />
+            <label class="form-label fw-semibold small">Выберите файл(ы) отчетности (.xml, .xlsx, .json)</label>
+            <input type="file" id="importFileInput" class="form-control" accept=".xml,.xlsx,.json" multiple />
+          </div>
+          <div class="mb-3">
+            <label class="form-label fw-semibold small">Или выберите целую папку с вложенными отчетами (например, <code>БОО2024</code>)</label>
+            <input type="file" id="importFolderInput" class="form-control" webkitdirectory directory multiple />
           </div>
           <div id="importResultAlert" class="d-none"></div>
         </div>
@@ -521,28 +525,37 @@
       const data = await res.json();
 
       const regSel = document.getElementById("filterRegion");
+      const prevReg = regSel.value;
+      regSel.innerHTML = `<option value="">Все регионы</option>`;
       data.regions.forEach(r => {
         const opt = document.createElement("option");
         opt.value = r.id;
         opt.textContent = `${r.code} — ${r.name}`;
         regSel.appendChild(opt);
       });
+      if (prevReg) regSel.value = prevReg;
 
       const indSel = document.getElementById("filterIndustry");
+      const prevInd = indSel.value;
+      indSel.innerHTML = `<option value="">Все отрасли</option>`;
       data.industries.forEach(i => {
         const opt = document.createElement("option");
         opt.value = i.id;
         opt.textContent = `${i.code} — ${i.name}`;
         indSel.appendChild(opt);
       });
+      if (prevInd) indSel.value = prevInd;
 
       const sizeSel = document.getElementById("filterSize");
+      const prevSize = sizeSel.value;
+      sizeSel.innerHTML = `<option value="">Все категории</option>`;
       data.size_classes.forEach(s => {
         const opt = document.createElement("option");
         opt.value = s;
         opt.textContent = s;
         sizeSel.appendChild(opt);
       });
+      if (prevSize) sizeSel.value = prevSize;
     }
 
     function getFilterQueryParams() {
@@ -867,37 +880,78 @@
     }
 
     async function submitImportFile() {
-      const input = document.getElementById("importFileInput");
+      const fileInput = document.getElementById("importFileInput");
+      const folderInput = document.getElementById("importFolderInput");
       const alertBox = document.getElementById("importResultAlert");
-      if (!input.files.length) {
+
+      let selectedFiles = Array.from(fileInput.files || []);
+      if (!selectedFiles.length && folderInput && folderInput.files && folderInput.files.length) {
+        selectedFiles = Array.from(folderInput.files).filter(f => {
+          const lower = f.name.toLowerCase();
+          return lower.endsWith(".xml") || lower.endsWith(".xlsx") || lower.endsWith(".json");
+        });
+      }
+
+      if (!selectedFiles.length) {
         alertBox.className = "alert alert-warning small";
-        alertBox.textContent = "Пожалуйста, выберите файл для импорта.";
+        alertBox.textContent = "Пожалуйста, выберите файл(ы) или папку с отчетами (.xml, .xlsx, .json).";
         return;
       }
 
-      const formData = new FormData();
-      formData.append("file", input.files[0]);
+      if (selectedFiles.length === 1) {
+        const formData = new FormData();
+        formData.append("file", selectedFiles[0]);
+        const res = await fetch("/api/import", { method: "POST", body: formData });
+        const data = await res.json();
 
-      const res = await fetch("/api/import", {
-        method: "POST",
-        body: formData
-      });
-      const data = await res.json();
+        if (!res.ok) {
+          alertBox.className = "alert alert-danger small";
+          alertBox.innerHTML = `<strong>Ошибка импорта:</strong> ${data.detail || "Некорректный файл"}`;
+          return;
+        }
 
-      if (!res.ok) {
-        alertBox.className = "alert alert-danger small";
-        alertBox.innerHTML = `<strong>Ошибка импорта:</strong> ${data.detail || "Некорректный файл"}`;
-        return;
-      }
-
-      if (data.duplicate_prevented) {
-        alertBox.className = "alert alert-info small";
-        alertBox.innerHTML = `<strong>Идемпотентность SHA-256:</strong> ${data.message}<br/>Организация: <b>${data.name_full}</b> (ИНН ${data.inn})`;
+        if (data.duplicate_prevented) {
+          alertBox.className = "alert alert-info small";
+          alertBox.innerHTML = `<strong>Идемпотентность SHA-256:</strong> ${data.message}<br/>Организация: <b>${data.name_full}</b> (ИНН ${data.inn})`;
+        } else {
+          alertBox.className = "alert alert-success small";
+          alertBox.innerHTML = `<strong>Успешно импортировано!</strong><br/>Организация: <b>${data.name_full}</b> (ИНН ${data.inn}), извлечено показателей: <b>${data.extracted_values}</b>.`;
+        }
       } else {
-        alertBox.className = "alert alert-success small";
-        alertBox.innerHTML = `<strong>Успешно импортировано!</strong><br/>Организация: <b>${data.name_full}</b> (ИНН ${data.inn}), извлечено показателей: <b>${data.extracted_values}</b>.`;
+        alertBox.className = "alert alert-secondary small";
+        alertBox.innerHTML = `Импорт пакета файлов (0 / ${selectedFiles.length})...`;
+        let okCount = 0;
+        let dupCount = 0;
+        let errCount = 0;
+        let totalVals = 0;
+
+        for (let i = 0; i < selectedFiles.length; i++) {
+          const formData = new FormData();
+          formData.append("file", selectedFiles[i]);
+          const res = await fetch("/api/import", { method: "POST", body: formData });
+          const data = await res.json();
+          if (!res.ok) {
+            errCount++;
+          } else if (data.duplicate_prevented) {
+            dupCount++;
+          } else {
+            okCount++;
+            totalVals += Number(data.extracted_values || 0);
+          }
+          alertBox.innerHTML = `Обработано файлов: <b>${i + 1} / ${selectedFiles.length}</b>...`;
+        }
+
+        alertBox.className = errCount > 0 ? "alert alert-warning small" : "alert alert-success small";
+        alertBox.innerHTML = `
+          <strong>Пакетный импорт завершен!</strong><br/>
+          Всего файлов: <b>${selectedFiles.length}</b> | Новых загружено: <b>${okCount}</b> | Дубликатов SHA-256 пропущено: <b>${dupCount}</b> | Ошибок: <b>${errCount}</b><br/>
+          Суммарно извлечено показателей: <b>${totalVals}</b>.
+        `;
       }
 
+      fileInput.value = "";
+      if (folderInput) folderInput.value = "";
+      await initDictionaries();
       await refreshDashboard();
       await loadImportLogs();
     }

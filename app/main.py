@@ -135,7 +135,7 @@ def _build_top_revenue_rows(
         to_rub = float(r.unit.to_rub) if r.unit and r.unit.to_rub else 1000.0
         pkg_unit_map[r.package_id] = (u_code, to_rub)
 
-    target_codes = ["2110", "2120", "2400", "1600", "1100", "1200", "1300", "1520"]
+    target_codes = ["2110", "2120", "2400", "1600", "1100", "1200", "1300", "1520", "UPR_KREDIT"]
     indicators = db.query(Indicator).filter(Indicator.code.in_(target_codes)).all()
     ind_id_to_code = {ind.id: ind.code for ind in indicators}
 
@@ -167,7 +167,7 @@ def _build_top_revenue_rows(
         net_profit = m.get("2400", 0.0)
         assets = m.get("1600", 0.0)
         equity = m.get("1300", 0.0)
-        payables = m.get("1520", 0.0)
+        payables = m.get("1520", m.get("UPR_KREDIT", 0.0))
 
         profitability = round((net_profit / revenue) * 100.0, 2) if revenue > 0 else 0.0
 
@@ -425,7 +425,8 @@ def get_organization_dynamics(org_id: int, db: Session = Depends(get_db)):
     values = (
         db.query(ReportValue)
         .options(joinedload(ReportValue.indicator), joinedload(ReportValue.slice))
-        .filter(ReportValue.report_id.in_(rep_ids), ReportValue.is_comparative == False)  # noqa: E712
+        .filter(ReportValue.report_id.in_(rep_ids))
+        .order_by(ReportValue.is_comparative.asc(), ReportValue.id.desc())
         .all()
         if rep_ids
         else []
@@ -439,7 +440,9 @@ def get_organization_dynamics(org_id: int, db: Session = Depends(get_db)):
             "rows": {},
         }
 
-    years_set = sorted({p.report_year for p in current_pkgs})
+    years_set = sorted(
+        {p.report_year for p in current_pkgs} | {rv.report_year for rv in values}
+    )
     chart_series = {yr: {"2110": 0.0, "2120": 0.0, "2400": 0.0, "1600": 0.0} for yr in years_set}
 
     for rv in values:
@@ -462,11 +465,13 @@ def get_organization_dynamics(org_id: int, db: Session = Depends(get_db)):
                 "values_by_year": {},
             }
 
-        val_float = float(rv.value) if rv.value is not None else None
-        forms_data[f_code]["rows"][row_key]["values_by_year"][str(rv.report_year)] = val_float
+        yr_key = str(rv.report_year)
+        if yr_key not in forms_data[f_code]["rows"][row_key]["values_by_year"]:
+            val_float = float(rv.value) if rv.value is not None else None
+            forms_data[f_code]["rows"][row_key]["values_by_year"][yr_key] = val_float
 
-        if rv.report_year in chart_series and ind.code in chart_series[rv.report_year] and (not sl or sl.code == "total"):
-            chart_series[rv.report_year][ind.code] = val_float or 0.0
+            if rv.report_year in chart_series and ind.code in chart_series[rv.report_year] and (not sl or sl.code == "total"):
+                chart_series[rv.report_year][ind.code] = val_float or 0.0
 
     formatted_forms = {}
     for f_code, f_info in forms_data.items():
@@ -574,7 +579,14 @@ def compare_organizations(
         for r in rows:
             if r["indicator_code"] == ind_code and r["slice_code"] == "total":
                 v = r["values_by_year"].get(str(yr))
-                return float(v) if v is not None else 0.0
+                if v is not None:
+                    return float(v)
+        if ind_code == "1520":
+            for r in rows:
+                if r["indicator_code"] == "UPR_KREDIT" and r["slice_code"] == "total":
+                    v = r["values_by_year"].get(str(yr))
+                    if v is not None:
+                        return float(v)
         return 0.0
 
     comparison_rows = []

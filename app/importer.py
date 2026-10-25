@@ -1,9 +1,10 @@
 import hashlib
 import io
 import json
+import re
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Set, Tuple
 
 import pandas as pd
 from lxml import etree
@@ -23,6 +24,58 @@ from app.models import (
     ReportValue,
     ImportFile,
 )
+
+
+# Полный справочник регионов РФ (включая все регионы из массива БОО2024)
+KNOWN_REGIONS: Dict[str, Tuple[str, str]] = {
+    "02": ("Республика Башкортостан", "ПФО"),
+    "03": ("Республика Бурятия", "ДФО"),
+    "05": ("Республика Дагестан", "СКФО"),
+    "16": ("Республика Татарстан", "ПФО"),
+    "23": ("Краснодарский край", "ЮФО"),
+    "24": ("Красноярский край", "СФО"),
+    "25": ("Приморский край", "ДФО"),
+    "26": ("Ставропольский край", "СКФО"),
+    "27": ("Хабаровский край", "ДФО"),
+    "29": ("Архангельская область", "СЗФО"),
+    "38": ("Иркутская область", "СФО"),
+    "42": ("Кемеровская область — Кузбасс", "СФО"),
+    "45": ("Курганская область", "УФО"),
+    "48": ("Липецкая область", "ЦФО"),
+    "50": ("Московская область", "ЦФО"),
+    "52": ("Нижегородская область", "ПФО"),
+    "55": ("Омская область", "СФО"),
+    "61": ("Ростовская область", "ЮФО"),
+    "62": ("Рязанская область", "ЦФО"),
+    "66": ("Свердловская область", "УФО"),
+    "69": ("Тверская область", "ЦФО"),
+    "71": ("Тульская область", "ЦФО"),
+    "74": ("Челябинская область", "УФО"),
+    "77": ("г. Москва", "ЦФО"),
+    "78": ("г. Санкт-Петербург", "СЗФО"),
+}
+
+# Полный справочник кодов ОКВЭД2 (включая все коды из массива БОО2024)
+KNOWN_OKVEDS: Dict[str, Tuple[str, str]] = {
+    "25.99": ("Производство прочих готовых металлических изделий, не включенных в другие группировки", "C"),
+    "41.20": ("Строительство жилых и нежилых зданий", "F"),
+    "47.19.1": ("Торговля розничная большим товарным ассортиментом с преобладанием непродовольственных товаров в неспециализированных магазинах", "G"),
+    "47.77.2": ("Торговля розничная ювелирными изделиями в специализированных магазинах", "G"),
+    "47.79": ("Торговля розничная бывшими в употреблении товарами в магазинах", "G"),
+    "62.01": ("Разработка компьютерного программного обеспечения", "J"),
+    "64.9": ("Деятельность по предоставлению прочих финансовых услуг, кроме услуг по страхованию и пенсионному обеспечению", "K"),
+    "64.92": ("Предоставление займов и прочих видов кредита", "K"),
+    "64.92.1": ("Деятельность по предоставлению потребительских кредитов", "K"),
+    "64.92.6": ("Деятельность по предоставлению ломбардами краткосрочных займов под залог движимого имущества", "K"),
+    "64.99": ("Деятельность по предоставлению прочих финансовых услуг, кроме услуг по страхованию и пенсионному обеспечению, не включенная в другие группировки", "K"),
+    "64.99.3": ("Капиталовложения в уставные капиталы, венчурное инвестирование, в том числе посредством инвестиционных компаний", "K"),
+    "64.99.6": ("Деятельность по финансовой взаимопомощи", "K"),
+    "65.22.1": ("Деятельность сельскохозяйственных кредитных потребительских кооперативов", "K"),
+    "68.31": ("Деятельность агентств недвижимости за вознаграждение или на договорной основе", "L"),
+    "69.10": ("Деятельность в области права", "M"),
+    "70.22": ("Консультирование по вопросам коммерческой деятельности и управления", "M"),
+    "82.99": ("Деятельность по предоставлению прочих вспомогательных услуг для бизнеса, не включенная в другие группировки", "N"),
+}
 
 
 class ImportValidationError(ValueError):
@@ -60,9 +113,11 @@ def _resolve_region(db: Session, inn: str, region_code: Optional[str] = None) ->
         code = inn[:2]
     if not code:
         return None
+    code = code.zfill(2)[:2]
     reg = db.query(Region).filter(Region.code == code).first()
     if not reg:
-        reg = Region(code=code, name=f"Субъект РФ (код {code})", federal_district="РФ")
+        name, fd = KNOWN_REGIONS.get(code, (f"Субъект РФ (код {code})", "РФ"))
+        reg = Region(code=code, name=name, federal_district=fd)
         db.add(reg)
         db.flush()
     return reg
@@ -74,10 +129,17 @@ def _resolve_industry(db: Session, okved_code: Optional[str], okved_name: Option
     code = str(okved_code).strip()
     ind = db.query(Industry).filter(Industry.code == code).first()
     if not ind:
+        known_name, known_sec = KNOWN_OKVEDS.get(
+            code,
+            (okved_name or f"Вид деятельности ОКВЭД2 {code}", "K" if code.startswith(("64", "65")) else "M"),
+        )
+        parent_code = code.split(".")[0]
+        parent_ind = db.query(Industry).filter(Industry.code == parent_code).first()
         ind = Industry(
             code=code,
-            name=okved_name or f"Вид деятельности ОКВЭД2 {code}",
-            section="K" if code.startswith("64") else "M",
+            name=okved_name or known_name,
+            parent_id=parent_ind.id if parent_ind else None,
+            section=known_sec,
         )
         db.add(ind)
         db.flush()
@@ -100,13 +162,14 @@ def _ensure_unit(db: Session, unit_code: str) -> Unit:
     return unit
 
 
-def _get_default_slice(db: Session) -> ValueSlice:
-    sl = db.query(ValueSlice).filter(ValueSlice.code == "total").first()
-    if not sl:
+def _get_slices_map(db: Session) -> Dict[str, ValueSlice]:
+    slices = {s.code: s for s in db.query(ValueSlice).all()}
+    if "total" not in slices:
         sl = ValueSlice(code="total", name="Итого (скалярное значение)", form_id=None)
         db.add(sl)
         db.flush()
-    return sl
+        slices["total"] = sl
+    return slices
 
 
 def _add_report_value(
@@ -119,7 +182,14 @@ def _add_report_value(
     raw_val: Any,
     source_column: str,
     is_comparative: bool,
-) -> ReportValue:
+    seen_keys: Optional[Set[Tuple[int, int, int, int, bool]]] = None,
+) -> Optional[ReportValue]:
+    if seen_keys is not None:
+        key = (report_id, indicator_id, slice_id, report_year, is_comparative)
+        if key in seen_keys:
+            return None
+        seen_keys.add(key)
+
     dec_val = _parse_decimal(raw_val)
     if dec_val is None:
         status = "not_disclosed"
@@ -158,8 +228,93 @@ def _supersede_previous_packages(db: Session, org_id: int, report_year: int, new
         .all()
     )
     for prev in prev_packages:
+        is_seed_pkg = all(
+            (imp.storage_uri or "").startswith("seed://")
+            for imp in prev.import_files
+        )
+        if not is_seed_pkg and prev.correction_no > new_package.correction_no:
+            new_package.is_current = False
+            new_package.superseded_by = prev.id
+            return
         prev.is_current = False
         prev.superseded_by = new_package.id
+
+
+def _normalize_address_and_region(
+    raw_attr: str,
+    adr_node: Optional[etree._Element],
+    inn: str,
+    kpp: str,
+) -> Tuple[str, str, str, Dict[str, Any]]:
+    """
+    Извлекает строковый адрес, 2-значный код региона, источник региона и JSON-структуру address_norm.
+    Поддерживает:
+    1) Дочерний узел <АдрМН Индекс="..." КодРегион="..." .../>
+    2) Строковый атрибут АдрМН в формате ФНС: "643,164010,29,Коношский р-н,,Коноша рп,Приозерная ул,25,,"
+    3) Свободный текстовый атрибут АдрМН + определение региона по КПП/ИНН.
+    """
+    fallback_region = kpp[:2] if (kpp and len(kpp) >= 2 and kpp[:2].isdigit()) else inn[:2]
+    region_source = "kpp" if (kpp and len(kpp) >= 2 and kpp[:2] != inn[:2]) else "address"
+
+    if adr_node is not None:
+        reg_code = (adr_node.get("КодРегион") or fallback_region).strip().zfill(2)[:2]
+        city = adr_node.get("Город") or adr_node.get("НаселПункт") or ""
+        street = adr_node.get("Улица") or ""
+        house = adr_node.get("Дом") or ""
+        postal = adr_node.get("Индекс") or ""
+        parts = [p for p in [postal, f"рег. {reg_code}", city, street, house] if p]
+        raw_str = ", ".join(parts) if parts else raw_attr
+        return (
+            raw_str,
+            reg_code,
+            "xml_address",
+            {
+                "postal_code": postal,
+                "region_code": reg_code,
+                "city": city,
+                "street": street,
+                "house": house,
+            },
+        )
+
+    raw_str = (raw_attr or "").strip()
+    if raw_str.startswith("643,"):
+        tokens = [t.strip() for t in raw_str.split(",")]
+        postal = tokens[1] if len(tokens) > 1 else ""
+        reg_code = tokens[2].zfill(2)[:2] if (len(tokens) > 2 and tokens[2].isdigit()) else fallback_region
+        district = tokens[3] if len(tokens) > 3 else ""
+        city = tokens[4] or (tokens[5] if len(tokens) > 5 else "")
+        street = tokens[6] if len(tokens) > 6 else ""
+        house = tokens[7] if len(tokens) > 7 else ""
+        clean_parts = [p for p in tokens[1:] if p]
+        return (
+            ", ".join(clean_parts),
+            reg_code,
+            "address",
+            {
+                "country_code": "643",
+                "postal_code": postal,
+                "region_code": reg_code,
+                "district": district,
+                "city": city,
+                "street": street,
+                "house": house,
+                "raw": raw_str,
+            },
+        )
+
+    postal_match = re.search(r"\b(\d{6})\b", raw_str)
+    postal = postal_match.group(1) if postal_match else ""
+    return (
+        raw_str or f"Субъект РФ {fallback_region}",
+        fallback_region,
+        region_source,
+        {
+            "postal_code": postal,
+            "region_code": fallback_region,
+            "raw": raw_str,
+        },
+    )
 
 
 def import_file_content(
@@ -174,7 +329,8 @@ def import_file_content(
     if not file_name:
         raise ImportValidationError("Имя файла не указано")
 
-    ext = file_name.lower().rsplit(".", 1)[-1] if "." in file_name else ""
+    clean_name = file_name.replace("\\", "/").split("/")[-1]
+    ext = clean_name.lower().rsplit(".", 1)[-1] if "." in clean_name else ""
     if ext not in ("xml", "xlsx", "json"):
         raise ImportValidationError(
             f"Неподдерживаемый формат файла '.{ext}'. Разрешены только .xml, .xlsx, .json"
@@ -202,15 +358,15 @@ def import_file_content(
     if not existing_import:
         import_record = ImportFile(
             sha256=sha256_hash,
-            file_name=file_name,
-            storage_uri=f"local://imports/{sha256_hash}_{file_name}",
+            file_name=clean_name,
+            storage_uri=f"local://imports/{sha256_hash}_{clean_name}",
             status="pending",
         )
         db.add(import_record)
         db.flush()
     else:
         import_record = existing_import
-        import_record.file_name = file_name
+        import_record.file_name = clean_name
         import_record.status = "pending"
         import_record.error = None
         db.flush()
@@ -239,13 +395,12 @@ def import_file_content(
         }
     except Exception as exc:
         db.rollback()
-        # Записываем ошибку в журнал импорта в новой транзакции
         err_rec = db.query(ImportFile).filter(ImportFile.sha256 == sha256_hash).first()
         if not err_rec:
             err_rec = ImportFile(
                 sha256=sha256_hash,
-                file_name=file_name,
-                storage_uri=f"local://imports/{sha256_hash}_{file_name}",
+                file_name=clean_name,
+                storage_uri=f"local://imports/{sha256_hash}_{clean_name}",
                 status="error",
                 error={"detail": str(exc)},
             )
@@ -256,7 +411,7 @@ def import_file_content(
         db.commit()
         if isinstance(exc, ImportValidationError):
             raise
-        raise ImportValidationError(f"Ошибка разбора файла {file_name}: {exc}") from exc
+        raise ImportValidationError(f"Ошибка разбора файла {clean_name}: {exc}") from exc
 
 
 def _decode_xml_bytes(content: bytes) -> tuple[str, str]:
@@ -306,7 +461,8 @@ def _import_xml_fns(db: Session, content: bytes, import_record: ImportFile) -> D
     correction_no = int(doc_node.get("НомКорр") or 0)
     doc_date = _parse_date(doc_node.get("ДатаДок"), report_year + 1)
     unit_code = (doc_node.get("ОКЕИ") or "384").strip()
-    audit_flag = str(doc_node.get("ПризнАудит") or "0") in ("1", "true", "True", "Да")
+    raw_audit = doc_node.get("ПрАудит") if doc_node.get("ПрАудит") is not None else doc_node.get("ПризнАудит")
+    audit_flag = str(raw_audit or "0") in ("1", "true", "True", "Да")
 
     svnp_node = doc_node.find("СвНП")
     npul_node = svnp_node.find("НПЮЛ") if svnp_node is not None else doc_node.find(".//НПЮЛ")
@@ -330,32 +486,20 @@ def _import_xml_fns(db: Session, content: bytes, import_record: ImportFile) -> D
     okved_code = (npul_node.get("ОКВЭД2") or doc_node.get("ОКВЭД2") or (svnp_node.get("ОКВЭД2") if svnp_node is not None else "") or "70.22").strip()
     size_class = (npul_node.get("КатСуб") or doc_node.get("КатСуб") or ("Малое" if knd == "0710096" else "Среднее")).strip()
 
-    # Адрес
+    # Адрес и регион
     adr_node = npul_node.find("АдрМН")
     if adr_node is None:
         adr_node = doc_node.find(".//АдрМН")
-    region_code = inn[:2]
-    address_raw = npul_node.get("АдрМН") or ""
-    address_norm = {"region_code": region_code}
-    if adr_node is not None:
-        region_code = (adr_node.get("КодРегион") or region_code).strip()
-        city = adr_node.get("Город") or adr_node.get("НаселПункт") or ""
-        street = adr_node.get("Улица") or ""
-        house = adr_node.get("Дом") or ""
-        postal = adr_node.get("Индекс") or ""
-        parts = [p for p in [postal, f"рег. {region_code}", city, street, house] if p]
-        address_raw = ", ".join(parts) if parts else address_raw
-        address_norm = {
-            "postal_code": postal,
-            "region_code": region_code,
-            "city": city,
-            "street": street,
-            "house": house,
-        }
+    address_raw, region_code, region_source, address_norm = _normalize_address_and_region(
+        raw_attr=npul_node.get("АдрМН") or "",
+        adr_node=adr_node,
+        inn=inn,
+        kpp=kpp,
+    )
 
     # Подписант
     podpisant_node = doc_node.find("Подписант")
-    signer_info = {"role": "Руководитель", "full_name": "Не указан"}
+    signer_info: Dict[str, Any] = {"role": "Руководитель", "full_name": "Не указан"}
     signer_type = "director"
     if podpisant_node is not None:
         pr_podp = podpisant_node.get("ПрПодп") or "1"
@@ -368,16 +512,24 @@ def _import_xml_fns(db: Session, content: bytes, import_record: ImportFile) -> D
             full_fio = " ".join(x for x in [fam, im, otch] if x)
         else:
             full_fio = podpisant_node.get("ФИО") or "Подписант ЮЛ"
+
+        sv_pred_node = podpisant_node.find("СвПред")
+        auth_doc = sv_pred_node.get("НаимДок") if sv_pred_node is not None else None
+        if auth_doc:
+            full_fio = f"{full_fio} ({auth_doc})"
+
         signer_info = {
             "pr_podp": pr_podp,
             "signer_type": signer_type,
             "full_name": full_fio,
+            "authority_doc": auth_doc,
         }
 
     region = _resolve_region(db, inn, region_code)
     industry = _resolve_industry(db, okved_code)
     _ensure_unit(db, unit_code)
-    default_slice = _get_default_slice(db)
+    slices_map = _get_slices_map(db)
+    default_slice = slices_map["total"]
 
     org = db.query(Organization).filter(Organization.inn == inn).first()
     if not org:
@@ -391,10 +543,10 @@ def _import_xml_fns(db: Session, content: bytes, import_record: ImportFile) -> D
             okopf=okopf,
             okfs=okfs,
             region_id=region.id if region else None,
-            region_source="xml_address",
+            region_source=region_source,
             size_class=size_class,
             size_source="knd_form",
-            address_raw=address_raw or f"Регион {region_code}",
+            address_raw=address_raw,
             address_norm=address_norm,
             signer_type=signer_type,
         )
@@ -407,13 +559,19 @@ def _import_xml_fns(db: Session, content: bytes, import_record: ImportFile) -> D
             org.ogrn = ogrn
         if okpo:
             org.okpo = okpo
+        if okopf:
+            org.okopf = okopf
+        if okfs:
+            org.okfs = okfs
         if industry:
             org.okved_id = industry.id
         if region:
             org.region_id = region.id
+            org.region_source = region_source
         if address_raw:
             org.address_raw = address_raw
             org.address_norm = address_norm
+        org.signer_type = signer_type
         db.flush()
 
     pkg = ReportPackage(
@@ -436,7 +594,6 @@ def _import_xml_fns(db: Session, content: bytes, import_record: ImportFile) -> D
 
     _supersede_previous_packages(db, org.id, report_year, pkg)
 
-    # Загружаем маппинги XPath из таблицы indicator_sources для данной версии формата
     sources: List[IndicatorSource] = (
         db.query(IndicatorSource)
         .filter(IndicatorSource.format_version == format_version)
@@ -455,9 +612,10 @@ def _import_xml_fns(db: Session, content: bytes, import_record: ImportFile) -> D
         "F5": "0710006",
     }
 
+    seen_keys: Set[Tuple[int, int, int, int, bool]] = set()
     extracted_count = 0
+
     for src in sources:
-        # Ищем узел по XPath относительно корня или документа
         xpath_expr = src.xml_path
         nodes = root.xpath(xpath_expr)
         if not nodes and xpath_expr.startswith("/Документ/"):
@@ -486,55 +644,94 @@ def _import_xml_fns(db: Session, content: bytes, import_record: ImportFile) -> D
             reports_by_form[form_code] = rep
 
         rep = reports_by_form[form_code]
+        target_slice = slices_map.get("operational", default_slice) if form_code == "F4" else default_slice
 
-        # 1) Отчетный период: СумОтч
-        val_otch = node.get("СумОтч")
+        # 1) Стандартные атрибуты СумОтч / На31ДекОтч
+        val_otch = node.get("СумОтч") if node.get("СумОтч") is not None else node.get("На31ДекОтч")
+        col_otch = "СумОтч" if node.get("СумОтч") is not None else "На31ДекОтч"
         if val_otch is not None:
-            _add_report_value(
+            rv = _add_report_value(
                 db=db,
                 report_id=rep.id,
                 indicator_id=src.indicator_id,
-                slice_id=default_slice.id,
+                slice_id=target_slice.id,
                 as_of=date(report_year, 12, 31),
                 report_year=report_year,
                 raw_val=val_otch,
-                source_column="СумОтч",
+                source_column=col_otch,
                 is_comparative=False,
+                seen_keys=seen_keys,
             )
-            extracted_count += 1
+            if rv is not None:
+                extracted_count += 1
 
-        # 2) Предыдущий год: СумПрдщ или СумПред
-        val_prev = node.get("СумПрдщ") if node.get("СумПрдщ") is not None else node.get("СумПред")
-        col_prev = "СумПрдщ" if node.get("СумПрдщ") is not None else "СумПред"
+        # 2) Предыдущий год: СумПрдщ / СумПред / На31ДекПред
+        val_prev = None
+        col_prev = "СумПрдщ"
+        for attr_name in ("СумПрдщ", "СумПред", "На31ДекПред"):
+            if node.get(attr_name) is not None:
+                val_prev = node.get(attr_name)
+                col_prev = attr_name
+                break
         if val_prev is not None:
-            _add_report_value(
+            rv = _add_report_value(
                 db=db,
                 report_id=rep.id,
                 indicator_id=src.indicator_id,
-                slice_id=default_slice.id,
+                slice_id=target_slice.id,
                 as_of=date(report_year - 1, 12, 31),
                 report_year=report_year - 1,
                 raw_val=val_prev,
                 source_column=col_prev,
                 is_comparative=True,
+                seen_keys=seen_keys,
             )
-            extracted_count += 1
+            if rv is not None:
+                extracted_count += 1
 
-        # 3) Позапрошлый год: СумПрдшв
-        val_prev2 = node.get("СумПрдшв")
+        # 3) Позапрошлый год: СумПрдшв / На31ДекПрПред
+        val_prev2 = node.get("СумПрдшв") if node.get("СумПрдшв") is not None else node.get("На31ДекПрПред")
+        col_prev2 = "СумПрдшв" if node.get("СумПрдшв") is not None else "На31ДекПрПред"
         if val_prev2 is not None:
-            _add_report_value(
+            rv = _add_report_value(
                 db=db,
                 report_id=rep.id,
                 indicator_id=src.indicator_id,
-                slice_id=default_slice.id,
+                slice_id=target_slice.id,
                 as_of=date(report_year - 2, 12, 31),
                 report_year=report_year - 2,
                 raw_val=val_prev2,
-                source_column="СумПрдшв",
+                source_column=col_prev2,
                 is_comparative=True,
+                seen_keys=seen_keys,
             )
-            extracted_count += 1
+            if rv is not None:
+                extracted_count += 1
+
+        # 4) Матричные атрибуты Формы 3 (Отчет об изменениях капитала): Итог, УстКапитал, ДобКапитал, РезКапитал
+        if form_code == "F3":
+            f3_slice_attrs = [
+                ("Итог", "total"),
+                ("УстКапитал", "ustav"),
+                ("ДобКапитал", "dobav"),
+                ("РезКапитал", "rezerv"),
+            ]
+            for attr_name, sl_code in f3_slice_attrs:
+                if node.get(attr_name) is not None and sl_code in slices_map:
+                    rv = _add_report_value(
+                        db=db,
+                        report_id=rep.id,
+                        indicator_id=src.indicator_id,
+                        slice_id=slices_map[sl_code].id,
+                        as_of=date(report_year, 12, 31),
+                        report_year=report_year,
+                        raw_val=node.get(attr_name),
+                        source_column=attr_name,
+                        is_comparative=False,
+                        seen_keys=seen_keys,
+                    )
+                    if rv is not None:
+                        extracted_count += 1
 
     db.flush()
     return {
@@ -578,7 +775,7 @@ def _import_json_report(db: Session, content: bytes, import_record: ImportFile) 
     region = _resolve_region(db, inn, region_code)
     industry = _resolve_industry(db, okved_code)
     _ensure_unit(db, unit_code)
-    default_slice = _get_default_slice(db)
+    default_slice = _get_slices_map(db)["total"]
 
     org = db.query(Organization).filter(Organization.inn == inn).first()
     if not org:
@@ -719,7 +916,7 @@ def _import_xlsx_report(db: Session, content: bytes, import_record: ImportFile) 
     region = _resolve_region(db, inn, region_code)
     industry = _resolve_industry(db, okved_code)
     _ensure_unit(db, "384")
-    default_slice = _get_default_slice(db)
+    default_slice = _get_slices_map(db)["total"]
 
     org = db.query(Organization).filter(Organization.inn == inn).first()
     if not org:
